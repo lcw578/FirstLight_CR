@@ -212,6 +212,14 @@ std::atomic<std::uint64_t> g_combat_epoch_first_sequence{1};
 std::atomic<std::uint64_t> g_combat_overflow_count{0};
 std::atomic<std::uint64_t> g_combat_rejected_capture_count{0};
 std::atomic<void *> g_combat_game_manager{nullptr};
+// Live-battle pointers captured from combat hook arguments (control channel
+// reads them lazily with full validation; the hooks only record addresses).
+std::atomic<void *> g_live_object_manager{nullptr};
+std::atomic<void *> g_live_player_object{nullptr};
+std::atomic<std::uint64_t> g_live_object_manager_generation{0};
+std::atomic<std::uint64_t> g_live_player_object_generation{0};
+std::atomic<void *> g_live_player_objects[2] = {{nullptr}, {nullptr}};
+std::atomic<std::uint64_t> g_live_player_objects_generation{0};
 std::atomic<void *> g_combat_object_manager{nullptr};
 std::atomic<std::uint64_t> g_combat_generation{0};
 std::atomic<std::uint64_t> g_combat_state_epoch{0};
@@ -435,8 +443,29 @@ bool current_combat_capture_context(CombatCaptureContext *result) {
     value.object_manager = g_combat_object_manager.load(std::memory_order_acquire);
     value.generation = g_combat_generation.load(std::memory_order_acquire);
     value.state_epoch = epoch_before;
+    // Liveness gate BEFORE any graph dereference: a freed manager can stay
+    // mapped with poisoned internals, so validate the heartbeat first. The bound
+    // manager must be the one currently stepping (a manager freed at a scene
+    // transition never steps again). If the heartbeat passes, each hop of the
+    // object-manager chain is additionally gated by readability.
+    const bool heartbeat_ok = value.game_manager != nullptr &&
+                              value.game_manager == g_recent_step_manager.load(std::memory_order_acquire);
+    if (value.game_manager != nullptr && !heartbeat_ok) {
+      g_combat_epoch_active.store(false, std::memory_order_release);
+      g_combat_object_manager.store(nullptr, std::memory_order_release);
+      g_combat_game_manager.store(nullptr, std::memory_order_release);
+      return false;
+    }
     if (value.object_manager == nullptr && value.game_manager != nullptr) {
-      value.object_manager = combat_object_manager_from_game_manager(value.game_manager);
+      if (process_range_is_readable(value.game_manager, 0xb0)) {
+        void *const world = read_object_field<void *>(value.game_manager, 0xa8);
+        if (world != nullptr && process_range_is_readable(world, 0xe8)) {
+          void *const player_zero = read_object_field<void *>(world, 0xe0);
+          if (player_zero != nullptr && process_range_is_readable(player_zero, 0x18)) {
+            value.object_manager = read_object_field<void *>(player_zero, 0x10);
+          }
+        }
+      }
     }
     const std::uint64_t epoch_after = g_combat_state_epoch.load(std::memory_order_acquire);
     if (epoch_before != epoch_after || value.game_manager == nullptr || value.generation == 0 ||
@@ -742,6 +771,13 @@ void capture_combat_entity(const void *pointer, void *object_manager, CombatEnti
     }
   }
   if (!found) {
+    return;
+  }
+  // Vector membership does not guarantee the object memory is still valid: the
+  // game can free an object while a stale vector entry survives until the next
+  // compaction. Gate the dereference on readability of every field this
+  // function touches (up to +0xb0).
+  if (!process_range_is_readable(pointer, 0xb0)) {
     return;
   }
   const std::uint32_t native_object_id = read_object_field<std::uint32_t>(pointer, 0x08);
@@ -1215,6 +1251,57 @@ void combat_spawn_hook(void *object_manager, void *object, std::int32_t option, 
   if (commit_to_live == 0) {
     return;
   }
+  // Live-battle pointer capture: record the battle object manager and, when
+  // present, the player state reference carried by spawned objects at +0x100.
+  // Pointer recording only — every deeper read happens later, gated by the
+  // control channel, never inside this hot hook.
+  {
+    // The spawn hook also runs for menu/native-render worlds. Publish a live
+    // root only while the callback belongs to the manager currently bound to
+    // the armed live generation. Re-check the identity after the native call
+    // so a scene transition cannot publish a pointer into a newer generation.
+    const std::uint64_t live_generation = g_live_generation.load(std::memory_order_acquire);
+    void *const live_manager = g_live_manager.load(std::memory_order_acquire);
+    const bool current_live_callback =
+        g_live_attach_armed.load(std::memory_order_acquire) && live_generation != 0 && live_manager != nullptr &&
+        live_manager == g_recent_step_manager.load(std::memory_order_acquire) &&
+        live_manager == g_live_manager.load(std::memory_order_acquire) &&
+        live_generation == g_live_generation.load(std::memory_order_acquire);
+    if (!current_live_callback) {
+      goto skip_live_pointer_publish;
+    }
+    void **live_objects = nullptr;
+    std::int32_t live_count = 0;
+    if (!live_object_vector_is_valid(object_manager, &live_objects, &live_count)) {
+      goto skip_live_pointer_publish;
+    }
+    (void)live_objects;
+    (void)live_count;
+    void *player_from_object = nullptr;
+    if (object != nullptr && process_range_is_readable(object, 0x108)) {
+      player_from_object = read_object_field<void *>(object, 0x100);
+    }
+    g_live_object_manager.store(object_manager, std::memory_order_release);
+    g_live_object_manager_generation.store(live_generation, std::memory_order_release);
+    if (live_pointer_is_plausible(player_from_object, 0x320) &&
+        read_object_field<void *>(player_from_object, 0x10) == object_manager) {
+      g_live_player_object.store(player_from_object, std::memory_order_release);
+      g_live_player_object_generation.store(live_generation, std::memory_order_release);
+      const std::int32_t owner = process_range_is_readable(object, 0x80)
+                                     ? read_object_field<std::int32_t>(object, 0x78)
+                                     : -1;
+      if (owner >= 0 && owner < 2) {
+        g_live_player_objects[owner].store(player_from_object, std::memory_order_release);
+        g_live_player_objects_generation.store(live_generation, std::memory_order_release);
+      }
+    }
+    static std::atomic<std::uint32_t> live_capture_log{0};
+    if (live_capture_log.fetch_add(1, std::memory_order_relaxed) < 16) {
+      LOGI("combat spawn capture #%u: objectManager=%p player=%p",
+             live_capture_log.load(std::memory_order_relaxed), object_manager, player_from_object);
+    }
+  }
+skip_live_pointer_publish:
   if (g_combat_remaining_spawn_observer != nullptr) {
     g_combat_remaining_spawn_observer(object_manager, object, commit_to_live);
   }

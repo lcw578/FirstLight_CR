@@ -297,6 +297,34 @@ std::int32_t g_last_controlled_tick = -1;
 bool g_control_gate_enabled = true;
 bool g_control_ended = false;
 bool g_controlled_step_active = false;
+// Live server-driven match attach (read-only).  The armed flag asks the step
+// hook to identify the next manager that belongs to neither the controlled
+// worker nor a native-render session; that manager is recorded for passive
+// observation only.  No gate, pause, or command path ever targets it.
+std::atomic<void *> g_live_manager{nullptr};
+std::atomic<void *> g_recent_step_manager{nullptr};
+
+// Live observation snapshot captured on the game's Mainloop thread inside the
+// step hook, where the battle manager is guaranteed alive. The control thread
+// only hands out this buffer; it never dereferences game memory itself.
+constexpr std::size_t kLiveSnapshotBytes = 256 * 1024;
+char g_live_snapshot_json[kLiveSnapshotBytes] = {};
+std::atomic<std::uint64_t> g_live_snapshot_sequence{0};
+std::uint64_t g_live_snapshot_tick = -1;
+bool g_live_snapshot_present = false;
+pthread_mutex_t g_live_snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
+std::atomic<std::uint64_t> g_live_generation{0};
+std::atomic<bool> g_live_attach_armed{false};
+std::atomic<std::uint32_t> g_live_attach_calls{0};
+std::atomic<void *> g_live_world{nullptr};
+std::atomic<std::int32_t> g_live_tick{-1};
+std::atomic<bool> g_live_world_seen{false};
+// These addresses are diagnostic latches only.  They are never used as the
+// authoritative model input; generation binding prevents allocator reuse from
+// carrying a player pointer across matches.
+std::atomic<void *> g_live_latched_players[2] = {{nullptr}, {nullptr}};
+std::atomic<std::uint64_t> g_live_latched_players_generation{0};
+std::atomic<std::size_t> g_live_world_offset{0};
 // Native-render timing remains owned by ReplayBattleController. Quarter-speed
 // units keep every supported multiplier exact without persistent float state:
 // 1=.25x, 2=.5x, 4=1x, 8=2x, 16=4x.
@@ -620,6 +648,7 @@ bool sha256_file(const char *path, char output[65]) {
 }
 constexpr std::size_t kControlResponseBytes = 64 * 1024;
 constexpr std::size_t kOrdinaryObservationResponseBytes = 256 * 1024;
+std::atomic<int> build_observation_last_fail_line{0};
 // Full observation captures are heap-backed.  The ordinary schema permits 256
 // object-vector slots, while one worst-case rich item is bounded by 24 KiB.
 // Twelve MiB covers the complete 256-slot ordinary + rich envelope plus the
@@ -717,9 +746,23 @@ bool suppress_offline_connection_error_if_needed();
 void game_state_step_hook(void *manager);
 void game_state_load_hook(void *manager, void *battle, void *command_array, void *auxiliary);
 void begin_combat_event_epoch(void *game_manager, std::uint64_t generation, std::uint64_t state_epoch);
-void begin_runtime_telemetry_epoch(void *game_manager, std::uint64_t generation, std::uint64_t state_epoch);
+void begin_runtime_telemetry_epoch(void *game_manager, std::uint64_t generation, std::uint64_t state_epoch,
+                                   bool enable_deep_telemetry = true);
 void bind_combat_event_object_manager(void *game_manager);
 void end_combat_event_epoch(void *game_manager);
+bool process_range_is_readable(const void *address, std::size_t size);
+template <typename T> T read_object_field(const void *object, std::size_t offset);
+bool read_battle_result(void *world, struct BattleResultView *result);
+void clear_live_snapshot_state_locked();
+// Defined by combat_event_telemetry.inc (included below); declared here so the
+// live lifecycle helpers can clear telemetry latches before that include.
+extern std::atomic<void *> g_live_object_manager;
+extern std::atomic<void *> g_live_player_object;
+extern std::atomic<std::uint64_t> g_live_object_manager_generation;
+extern std::atomic<std::uint64_t> g_live_player_object_generation;
+extern std::atomic<void *> g_live_player_objects[2];
+extern std::atomic<std::uint64_t> g_live_player_objects_generation;
+
 std::size_t copy_tower_troop_runtime_snapshot(std::uint64_t generation, std::uint64_t state_epoch, std::int32_t tick,
                                               StoredTowerTroopRuntimeState *output, std::size_t capacity);
 void restore_tower_troop_runtime_snapshot(std::uint64_t generation, std::uint64_t state_epoch, std::int32_t tick,
@@ -803,6 +846,7 @@ bool inspect_content_runtime(void **root_out = nullptr, void **context_out = nul
 }
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
+
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, kLogTag, __VA_ARGS__)
 
 bool prewarm_location_tilemap(void *content_context, std::int32_t location_id) {
@@ -2207,14 +2251,20 @@ struct NativeVectorView {
 
 bool read_native_vector(const void *object, std::size_t offset, std::int32_t maximum_capacity,
                         NativeVectorView *result) {
-  if (object == nullptr || result == nullptr || maximum_capacity < 0) {
+  if (object == nullptr || result == nullptr || maximum_capacity < 0 ||
+      !process_range_is_readable(object, offset + 0x10)) {
     return false;
   }
   result->data = read_object_field<void *>(object, offset);
   result->capacity = read_object_field<std::int32_t>(object, offset + 0x08);
   result->count = read_object_field<std::int32_t>(object, offset + 0x0c);
-  return result->count >= 0 && result->capacity >= result->count && result->capacity <= maximum_capacity &&
-         (result->count == 0 || result->data != nullptr);
+  if (result->count < 0 || result->capacity < result->count || result->capacity > maximum_capacity ||
+      (result->count != 0 && result->data == nullptr)) {
+    return false;
+  }
+  return result->count == 0 ||
+         (static_cast<std::size_t>(result->count) <= (SIZE_MAX / sizeof(void *)) &&
+          process_range_is_readable(result->data, static_cast<std::size_t>(result->count) * sizeof(void *)));
 }
 
 struct NativeCardSelection {
@@ -2324,6 +2374,225 @@ bool read_battle_result(void *world, BattleResultView *result) {
   value.readable = true;
   *result = value;
   return true;
+}
+
+// A pointer obtained from a live manager is not trustworthy merely because it
+// is non-null: loading flags and allocator residue have both appeared in this
+// slot.  Keep this gate deliberately small and structural so it can be used on
+// the game's step thread before any deep player/entity reads.
+bool live_pointer_is_plausible(const void *pointer, std::size_t bytes) {
+  const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(pointer);
+  if (pointer == nullptr || raw < 0x10000u || (raw & (alignof(void *) - 1)) != 0) {
+    return false;
+  }
+  return process_range_is_readable(pointer, bytes);
+}
+
+bool live_object_vector_is_valid(void *object_manager, void ***objects_out = nullptr,
+                                 std::int32_t *count_out = nullptr) {
+  if (!live_pointer_is_plausible(object_manager, 0x18)) {
+    return false;
+  }
+  void **objects = read_object_field<void **>(object_manager, 0x08);
+  const std::int32_t capacity = read_object_field<std::int32_t>(object_manager, 0x10);
+  const std::int32_t count = read_object_field<std::int32_t>(object_manager, 0x14);
+  if (count < 0 || capacity < count || capacity > 100000 || (count != 0 && objects == nullptr)) {
+    return false;
+  }
+  if (count > 0 && !process_range_is_readable(objects, static_cast<std::size_t>(count) * sizeof(void *))) {
+    return false;
+  }
+  if (objects_out != nullptr) {
+    *objects_out = objects;
+  }
+  if (count_out != nullptr) {
+    *count_out = count;
+  }
+  return true;
+}
+
+bool live_player_root_is_valid(void *player, void *object_manager) {
+  if (!live_pointer_is_plausible(player, 0x320) || object_manager == nullptr ||
+      read_object_field<void *>(player, 0x10) != object_manager) {
+    return false;
+  }
+  const std::int32_t elixir = read_object_field<std::int32_t>(player, 0x2f8);
+  if (elixir < -1 || elixir > 100000) {
+    return false;
+  }
+  void *const identity = read_object_field<void *>(player, 0x30);
+  void *const deck = read_object_field<void *>(player, 0x88);
+  if (!live_pointer_is_plausible(identity, 0x08) || !live_pointer_is_plausible(deck, 0x30)) {
+    return false;
+  }
+  NativeVectorView hand;
+  NativeVectorView cycle;
+  return read_native_vector(player, 0x220, kMaxHandCards, &hand) &&
+         read_native_vector(player, 0x230, kMaxCycleCards, &cycle);
+}
+
+bool live_world_graph_is_valid(void *world, void ***objects_out = nullptr, std::int32_t *count_out = nullptr) {
+  if (!live_pointer_is_plausible(world, 0x1e4)) {
+    return false;
+  }
+  void *player_zero = read_object_field<void *>(world, 0xe0);
+  if (!live_pointer_is_plausible(player_zero, 0x18)) {
+    return false;
+  }
+  void *object_manager = read_object_field<void *>(player_zero, 0x10);
+  return live_object_vector_is_valid(object_manager, objects_out, count_out);
+}
+
+void clear_live_snapshot_state_locked() {
+  // Caller owns g_live_snapshot_mutex.  Clear the contents before publishing
+  // the new sequence so a control-thread reader can never mistake an old JSON
+  // body for the newly armed match.
+  g_live_snapshot_present = false;
+  g_live_snapshot_tick = -1;
+  g_live_snapshot_json[0] = '\0';
+  g_live_snapshot_sequence.store(0, std::memory_order_release);
+  g_live_world_offset.store(0, std::memory_order_release);
+  g_live_world.store(nullptr, std::memory_order_release);
+  g_live_tick.store(-1, std::memory_order_release);
+  g_live_world_seen.store(false, std::memory_order_release);
+  g_live_latched_players[0].store(nullptr, std::memory_order_release);
+  g_live_latched_players[1].store(nullptr, std::memory_order_release);
+  g_live_latched_players_generation.store(0, std::memory_order_release);
+  g_live_object_manager_generation.store(0, std::memory_order_release);
+  g_live_player_object_generation.store(0, std::memory_order_release);
+  g_live_player_objects_generation.store(0, std::memory_order_release);
+  g_live_player_objects[0].store(nullptr, std::memory_order_release);
+  g_live_player_objects[1].store(nullptr, std::memory_order_release);
+  g_live_object_manager.store(nullptr, std::memory_order_release);
+  g_live_player_object.store(nullptr, std::memory_order_release);
+}
+
+void reset_live_snapshot_state() {
+  pthread_mutex_lock(&g_live_snapshot_mutex);
+  clear_live_snapshot_state_locked();
+  pthread_mutex_unlock(&g_live_snapshot_mutex);
+}
+
+
+// Live server-driven battles never step through the replay-controller hooks: the
+// live controller subclass overrides them, and its GameStateManager bypasses the
+// menu-scene step path entirely. The engine keeps the CURRENT battle controller in
+// replayManager+0x20 and the controller's GameStateManager at controller+0x90, for
+// replays and live battles alike. While a live attach is armed, adopt that manager
+// the moment a battle mounts (world graph present), so observe reads real PvP ticks.
+bool try_adopt_live_battle_manager_locked(std::uint64_t *adopted_generation_out) {
+  if (g_live_manager.load(std::memory_order_acquire) != nullptr) {
+    return false;
+  }
+  if (g_replay_manager_getter == nullptr) {
+    return false;
+  }
+  void *replay_manager = g_replay_manager_getter();
+  if (replay_manager == nullptr) {
+    return false;
+  }
+  void *controller = nullptr;
+  std::memcpy(&controller, static_cast<std::uint8_t *>(replay_manager) + 0x20, sizeof(controller));
+  if (controller == nullptr || !process_range_is_readable(controller, 0x98)) {
+    return false;
+  }
+  void *manager = nullptr;
+  std::memcpy(&manager, static_cast<std::uint8_t *>(controller) + 0x90, sizeof(manager));
+  if (manager == nullptr || !process_range_is_readable(manager, 0xb0)) {
+    return false;
+  }
+  void *world = read_object_field<void *>(manager, 0xa8);
+  if (!live_world_graph_is_valid(world)) {
+    return false;
+  }
+  // Only adopt genuine battle worlds: the lobby/menu scene also mounts a world
+  // graph, but its battle-result view does not parse. Gating here keeps observe
+  // free of bogus "failed to encode" noise between matches.
+  BattleResultView adopt_battle_result;
+  if (!read_battle_result(world, &adopt_battle_result)) {
+    return false;
+  }
+  if (manager == g_recent_step_manager.load(std::memory_order_acquire)) {
+    // A manager driven by the hooked GameStateManager::step is a menu/scene
+    // manager. Live battle managers bypass that step path entirely, so refuse
+    // to adopt anything the scene loop is stepping.
+    return false;
+  }
+  void *expected = nullptr;
+  if (!g_live_manager.compare_exchange_strong(expected, manager)) {
+    return false;
+  }
+  ++g_control_generation;
+  const std::uint64_t live_generation = g_control_generation;
+  g_live_generation.store(live_generation, std::memory_order_release);
+  reset_live_snapshot_state();
+  begin_runtime_telemetry_epoch(manager, live_generation, live_generation, false);
+  bind_combat_event_object_manager(manager);
+  if (adopted_generation_out != nullptr) {
+    *adopted_generation_out = live_generation;
+  }
+  LOGI("live adopt: manager=%p generation=%llu controller=%p", manager,
+       static_cast<unsigned long long>(live_generation), controller);
+  return true;
+}
+
+// A live manager adopted from the scene graph can be freed by the game at any
+// scene transition (lobby teardown when a battle mounts). Guard every observation
+// against that window: the manager struct and its first graph hops must remain
+// mapped before any deep read.
+void *live_world_for_manager_locked(void *manager);
+
+bool live_manager_graph_readable_locked(void *manager) {
+  if (!live_pointer_is_plausible(manager, 0xb0)) {
+    return false;
+  }
+  void *world = live_world_for_manager_locked(manager);
+  if (world == nullptr) {
+    return false;
+  }
+  // Semantic readiness is intentionally checked here for the live binding: if
+  // the world graph disappears, retaining the old manager would allow a stale
+  // snapshot to survive into the next match.
+  return live_world_graph_is_valid(world);
+}
+
+// Live server-driven battles keep their world outside GameStateManager+0xa8 (that
+// slot stays null for the whole match). Discover the world by scanning the manager's
+// fixed header for a pointer whose shape matches the battle world: candidate+0xe0
+// yields a player state whose +0x10 yields an object manager with a sane count.
+// The scan is bounded, read-only, and caches the offset that validated first.
+void *live_world_for_manager_locked(void *manager) {
+  if (!live_pointer_is_plausible(manager, 0xb0)) {
+    return nullptr;
+  }
+  void *world = read_object_field<void *>(manager, 0xa8);
+  if (live_world_graph_is_valid(world)) {
+    return world;
+  }
+  const std::size_t cached_offset = g_live_world_offset.load(std::memory_order_acquire);
+  if (cached_offset != 0) {
+    void *cached = read_object_field<void *>(manager, cached_offset);
+    if (live_world_graph_is_valid(cached)) {
+      return cached;
+    }
+    g_live_world_offset.store(0, std::memory_order_release);
+  }
+  for (std::size_t offset = 0; offset + 8 <= 0xb0; offset += 8) {
+    void *candidate = read_object_field<void *>(manager, offset);
+    void **objects = nullptr;
+    std::int32_t count = 0;
+    if (!live_world_graph_is_valid(candidate, &objects, &count)) {
+      continue;
+    }
+    if (count <= 0) {
+      continue;
+    }
+    g_live_world_offset.store(offset, std::memory_order_release);
+    LOGI("live world discovered at manager+0x%zx manager=%p world=%p objects=%d", offset, manager, candidate,
+         count);
+    return candidate;
+  }
+  return nullptr;
 }
 
 bool consume_state_snapshot_prelude(void *stream) {
@@ -2716,13 +2985,19 @@ struct PlayerStateView {
 };
 
 bool read_player_state(void *world, std::int32_t owner, PlayerStateView *result) {
-  if (world == nullptr || result == nullptr || owner < 0 || owner >= kPlayerCount) {
+  // Defense at the function boundary: live battle managers can carry non-world
+  // values at the +0xa8 slot (null during loading, small flags once the live
+  // simulation starts). Reject anything that is not a readable, plausibly-sized
+  // world object before the first dereference.
+  if (world == nullptr || result == nullptr || owner < 0 || owner >= kPlayerCount ||
+      !process_range_is_readable(world, 0x100)) {
     return false;
   }
   result->player = read_object_field<void *>(world, 0xe0 + owner * sizeof(void *));
   result->identity = read_object_field<void *>(world, 0x30 + owner * sizeof(void *));
   result->deck = read_object_field<void *>(world, 0x88 + owner * sizeof(void *));
-  if (result->player == nullptr || result->identity == nullptr || result->deck == nullptr) {
+  if (!live_pointer_is_plausible(result->player, 0x320) || !live_pointer_is_plausible(result->identity, 0x08) ||
+      !live_pointer_is_plausible(result->deck, 0x30)) {
     return false;
   }
   result->account_id_high = read_object_field<std::uint32_t>(result->identity, 0x00);
@@ -2751,12 +3026,15 @@ bool read_card_state(const PlayerStateView &player, std::int32_t deck_slot, bool
     return false;
   }
   auto **slots = static_cast<void **>(player.deck_slots.data);
+  if (!process_range_is_readable(slots + deck_slot, sizeof(void *))) {
+    return false;
+  }
   void *battle_deck_slot = slots[deck_slot];
-  if (battle_deck_slot == nullptr) {
+  if (battle_deck_slot == nullptr || !process_range_is_readable(battle_deck_slot, 0x18)) {
     return false;
   }
   void *card_data = read_object_field<void *>(battle_deck_slot, 0x10);
-  if (card_data == nullptr) {
+  if (card_data == nullptr || !process_range_is_readable(card_data, 0x44)) {
     return false;
   }
 
@@ -4369,16 +4647,33 @@ bool read_shield(const void *object, std::int32_t *shield, std::int32_t *maximum
 #include "remaining_runtime_telemetry.inc"
 #include "tower_troop_runtime_telemetry.inc"
 
-void begin_runtime_telemetry_epoch(void *game_manager, std::uint64_t generation, std::uint64_t state_epoch) {
+void begin_runtime_telemetry_epoch(void *game_manager, std::uint64_t generation, std::uint64_t state_epoch,
+                                   bool enable_deep_telemetry) {
   // Close the combat capture gate first so no new phase callback can obtain
   // an old context while the phase ring/cache identity is reset.
   end_combat_event_epoch(nullptr);
+  if (!enable_deep_telemetry) {
+    // A zero identity makes every deep hook fail closed through its existing
+    // generation/state checks.  This keeps the offline lifecycle unchanged
+    // while preventing live hooks from traversing allocator-owned pointers.
+    begin_phase_runtime_epoch(0, 0);
+    begin_special_movement_runtime_epoch(0, 0);
+    begin_action_movement_runtime_epoch(0, 0);
+    begin_character_state_runtime_epoch(0, 0);
+    begin_tower_troop_runtime_epoch(0, 0);
+    return;
+  }
   begin_phase_runtime_epoch(generation, state_epoch);
   begin_special_movement_runtime_epoch(generation, state_epoch);
   begin_action_movement_runtime_epoch(generation, state_epoch);
   begin_character_state_runtime_epoch(generation, state_epoch);
   begin_tower_troop_runtime_epoch(generation, state_epoch);
-  begin_combat_event_epoch(game_manager, generation, state_epoch);
+  // Live observation starts in shallow mode.  Rings are reset above so rich
+  // output remains epoch-consistent, but combat/deep hooks stay closed until a
+  // later, explicitly validated experiment enables them.
+  if (enable_deep_telemetry) {
+    begin_combat_event_epoch(game_manager, generation, state_epoch);
+  }
 }
 
 std::uint64_t runtime_state_epoch_for_manager_locked(void *manager, std::uint64_t generation) {
@@ -4396,7 +4691,7 @@ std::uint64_t runtime_state_epoch_for_manager_locked(void *manager, std::uint64_
 }
 
 bool build_observation_json(void *manager, std::uint64_t generation, char *response, std::size_t response_size,
-                            bool *complete_out = nullptr) {
+                            bool *complete_out = nullptr, void *world_override = nullptr) {
   if (complete_out != nullptr) {
     *complete_out = false;
   }
@@ -4404,7 +4699,21 @@ bool build_observation_json(void *manager, std::uint64_t generation, char *respo
     return false;
   }
 
-  void *world = read_object_field<void *>(manager, 0xa8);
+  if (!live_pointer_is_plausible(manager, 0xb0)) {
+    std::snprintf(response, response_size, "{\"ok\":false,\"error\":\"active manager is unreadable\"}");
+    return false;
+  }
+  const bool live_manager = manager == g_live_manager.load(std::memory_order_acquire) &&
+                            g_live_generation.load(std::memory_order_acquire) == generation;
+  if (live_manager && world_override == nullptr) {
+    std::snprintf(response, response_size, "{\"ok\":false,\"error\":\"active live world is not published\"}");
+    return false;
+  }
+  void *world = world_override != nullptr ? world_override : read_object_field<void *>(manager, 0xa8);
+  if (world_override != nullptr && !live_world_graph_is_valid(world)) {
+    std::snprintf(response, response_size, "{\"ok\":false,\"error\":\"active live world is invalid\"}");
+    return false;
+  }
   void *king_tower = world == nullptr ? nullptr : read_object_field<void *>(world, 0xe0);
   void *object_manager = king_tower == nullptr ? nullptr : read_object_field<void *>(king_tower, 0x10);
   if (world == nullptr || king_tower == nullptr || object_manager == nullptr) {
@@ -4453,6 +4762,7 @@ bool build_observation_json(void *manager, std::uint64_t generation, char *respo
                    battle_result.finalized ? "true" : "false", world_result_json, battle_result.world_result_raw,
                    winner_json, battle_result.crowns_raw[0], battle_result.crowns_raw[1],
                    headless_observation ? count_stored_snapshots_locked() : 0, count, queued_commands)) {
+    json.mark(__LINE__);
     return false;
   }
 
@@ -4471,6 +4781,7 @@ bool build_observation_json(void *manager, std::uint64_t generation, char *respo
                      owner == 0 ? "" : ",", owner, static_cast<unsigned long long>(account_id), player.account_id_high,
                      player.account_id_low, player.elixir_raw, static_cast<double>(player.elixir_raw) / 10000.0,
                      player.crowns_raw)) {
+      json.mark(__LINE__);
       return false;
     }
 
@@ -4503,12 +4814,14 @@ bool build_observation_json(void *manager, std::uint64_t generation, char *respo
                                         "\"cardParameter\":null,\"cost\":null}",
                                         emitted_hand_count == 0 ? "" : ",", hand_index, card.deck_slot, card.card_id);
       if (!appended) {
+        json.mark(__LINE__);
         return false;
       }
       ++emitted_hand_count;
     }
 
     if (!json.append("],\"cycle\":[")) {
+      json.mark(__LINE__);
       return false;
     }
     auto *cycle_slots = static_cast<const std::int32_t *>(player.cycle.data);
@@ -4526,39 +4839,52 @@ bool build_observation_json(void *manager, std::uint64_t generation, char *respo
     }
 
     if (!json.append("],\"nextCard\":")) {
+      json.mark(__LINE__);
       return false;
     }
     if (player.cycle.count == 0) {
       if (!json.append("null")) {
+        json.mark(__LINE__);
         return false;
       }
     } else {
       CardStateView next_card;
       if (!read_card_state(player, cycle_slots[0], false, &next_card) ||
           !json.append("{\"deckSlot\":%d,\"cardId\":%d}", next_card.deck_slot, next_card.card_id)) {
+        json.mark(__LINE__);
         return false;
       }
     }
 
     if (!json.append(",\"deck\":[")) {
+      json.mark(__LINE__);
       return false;
     }
     for (std::int32_t deck_slot = 0; deck_slot < player.deck_slots.count; ++deck_slot) {
       CardStateView card;
-      if (!read_card_state(player, deck_slot, true, &card) ||
-          !json.append("%s{\"deckSlot\":%d,\"cardId\":%d,"
+      if (!read_card_state(player, deck_slot, true, &card)) {
+        std::snprintf(response, response_size,
+                      "{\"ok\":false,\"error\":\"native deck card is invalid\","
+                      "\"owner\":%d,\"deckSlot\":%d}",
+                      owner, deck_slot);
+        return false;
+      }
+      if (!json.append("%s{\"deckSlot\":%d,\"cardId\":%d,"
                        "\"commandCardId\":%d,\"cardParameter\":%u,\"cost\":%d}",
                        deck_slot == 0 ? "" : ",", card.deck_slot, card.card_id, card.command_card_id,
                        card.card_parameter, card.cost)) {
+        json.mark(__LINE__);
         return false;
       }
     }
     if (!json.append("]}")) {
+      json.mark(__LINE__);
       return false;
     }
   }
 
   if (!json.append("],\"objects\":[")) {
+    json.mark(__LINE__);
     return false;
   }
 
@@ -4573,8 +4899,16 @@ bool build_observation_json(void *manager, std::uint64_t generation, char *respo
       written = std::snprintf(item, sizeof(item), "%s{\"slot\":%d,\"null\":true}", returned == 0 ? "" : ",", index);
     } else {
       NativeEntityIdentityView identity;
-      if (!read_native_entity_identity(object, &identity) ||
-          !native_object_id_is_unique_in_vector(object, objects, count, identity.native_object_id)) {
+      if (!read_native_entity_identity(object, &identity)) {
+        std::snprintf(response, response_size,
+                      "{\"ok\":false,\"error\":\"native entity identity is invalid\",\"slot\":%d}",
+                      index);
+        return false;
+      }
+      if (!native_object_id_is_unique_in_vector(object, objects, count, identity.native_object_id)) {
+        std::snprintf(response, response_size,
+                      "{\"ok\":false,\"error\":\"native object id is not unique\",\"slot\":%d,\"nativeObjectId\":%u}",
+                      index, identity.native_object_id);
         return false;
       }
       const std::uint32_t native_object_id = identity.native_object_id;
@@ -4623,11 +4957,13 @@ bool build_observation_json(void *manager, std::uint64_t generation, char *respo
   if (encoded && complete_out != nullptr) {
     *complete_out = !truncated;
   }
+  build_observation_last_fail_line.store(encoded ? 0 : (json.fail_line() ? json.fail_line() : -1),
+                                         std::memory_order_release);
   return encoded;
 }
 
 bool build_rich_observation_json(void *manager, std::uint64_t generation, char *response, std::size_t response_size,
-                                 bool *complete_out = nullptr) {
+                                 bool *complete_out = nullptr, void *world_override = nullptr) {
   if (complete_out != nullptr) {
     *complete_out = false;
   }
@@ -4635,7 +4971,24 @@ bool build_rich_observation_json(void *manager, std::uint64_t generation, char *
     return false;
   }
 
-  void *world = read_object_field<void *>(manager, 0xa8);
+  if (!live_pointer_is_plausible(manager, 0xb0)) {
+    std::snprintf(response, response_size,
+                  "{\"ok\":false,\"schema\":\"native-rich-telemetry.v3\",\"error\":\"active manager is unreadable\"}");
+    return false;
+  }
+  const bool live_manager = manager == g_live_manager.load(std::memory_order_acquire) &&
+                            g_live_generation.load(std::memory_order_acquire) == generation;
+  if (live_manager && world_override == nullptr) {
+    std::snprintf(response, response_size,
+                  "{\"ok\":false,\"schema\":\"native-rich-telemetry.v3\",\"error\":\"active live world is not published\"}");
+    return false;
+  }
+  void *world = world_override != nullptr ? world_override : read_object_field<void *>(manager, 0xa8);
+  if (world_override != nullptr && !live_world_graph_is_valid(world)) {
+    std::snprintf(response, response_size,
+                  "{\"ok\":false,\"schema\":\"native-rich-telemetry.v3\",\"error\":\"active live world is invalid\"}");
+    return false;
+  }
   void *king_tower = world == nullptr ? nullptr : read_object_field<void *>(world, 0xe0);
   void *object_manager = king_tower == nullptr ? nullptr : read_object_field<void *>(king_tower, 0x10);
   if (world == nullptr || king_tower == nullptr || object_manager == nullptr) {
@@ -6607,6 +6960,12 @@ void handle_control_command(int socket_fd, const char *command) {
     const bool offline_control_session = g_offline_control_session_active.load(std::memory_order_acquire);
     const std::uint64_t offline_connection_errors_suppressed =
         g_native_offline_connection_errors_suppressed.load(std::memory_order_acquire);
+    pthread_mutex_lock(&g_control_mutex);
+    void *const live_status_manager = g_live_manager.load(std::memory_order_acquire);
+    const bool live_attached = live_status_manager != nullptr && g_live_generation.load(std::memory_order_acquire) != 0;
+    const std::int32_t live_tick =
+        live_attached && g_game_state_tick != nullptr ? g_game_state_tick(live_status_manager) : -1;
+    pthread_mutex_unlock(&g_control_mutex);
     pthread_mutex_lock(&g_render_gate_mutex);
     const bool render_suppressed = g_render_suppressed;
     pthread_mutex_unlock(&g_render_gate_mutex);
@@ -6672,7 +7031,9 @@ void handle_control_command(int socket_fd, const char *command) {
                   "\"configLocationId\":%d,\"configCommandCount\":%d,\"configEventCount\":%d,\"loadedQueueCount\":%d,"
                   "\"tilemapEnsureCalls\":%u,\"locationData\":\"%p\",\"tilemap\":\"%p\","
                   "\"configCommandWords\":[\"%016llx\",\"%016llx\",\"%016llx\","
-                  "\"%016llx\",\"%016llx\",\"%016llx\",\"%016llx\",\"%016llx\"]}",
+                  "\"%016llx\",\"%016llx\",\"%016llx\",\"%016llx\",\"%016llx\"],"
+                  "\"liveAttached\":%s,\"liveArmed\":%s,\"liveTick\":%d,"
+                  "\"liveManager\":\"%p\",\"liveGeneration\":%llu,\"liveAttachCalls\":%u}",
                   cold_ready ? "true" : "false", cold_ready ? "true" : "false", content_published ? "true" : "false",
                   content_root, content_context,
                   native_render_mode ? "native-render"
@@ -6718,9 +7079,246 @@ void handle_control_command(int socket_fd, const char *command) {
                   static_cast<unsigned long long>(g_last_config_command_words[4]),
                   static_cast<unsigned long long>(g_last_config_command_words[5]),
                   static_cast<unsigned long long>(g_last_config_command_words[6]),
-                  static_cast<unsigned long long>(g_last_config_command_words[7]));
+                  static_cast<unsigned long long>(g_last_config_command_words[7]),
+                  live_attached ? "true" : "false",
+                  g_live_attach_armed.load(std::memory_order_acquire) ? "true" : "false", live_tick,
+                  live_status_manager,
+                  static_cast<unsigned long long>(
+                      live_attached ? g_live_generation.load(std::memory_order_acquire) : 0),
+                  g_live_attach_calls.load(std::memory_order_relaxed));
     pthread_mutex_unlock(&g_control_mutex);
     send_control_response(socket_fd, response);
+    return;
+  }
+
+  if (std::strcmp(command, "live-observe on") == 0 || std::strcmp(command, "live-observe off") == 0) {
+    const bool arm = std::strcmp(command, "live-observe on") == 0;
+    pthread_mutex_lock(&g_control_mutex);
+    if (arm) {
+      if (g_live_manager.load(std::memory_order_acquire) != nullptr) {
+        // Detach the previous live manager first so a re-arm always attaches
+        // to the next non-owned match from a clean read-only state.
+        g_live_manager.store(nullptr, std::memory_order_release);
+        g_live_generation.store(0, std::memory_order_release);
+        // Close the combat capture gate bound to the detached manager: the
+        // scene can free that manager at any time, and every telemetry hook
+        // consults this gate on its hot path. Leaving it armed would let a
+        // later callback dereference the freed manager (use-after-free).
+        end_combat_event_epoch(nullptr);
+        reset_live_snapshot_state();
+      }
+      // Even when no previous manager is currently attached, arming starts a
+      // fresh diagnostic generation from an empty published snapshot.
+      reset_live_snapshot_state();
+      g_live_attach_armed.store(true, std::memory_order_release);
+    } else {
+      g_live_attach_armed.store(false, std::memory_order_release);
+      g_live_manager.store(nullptr, std::memory_order_release);
+      g_live_generation.store(0, std::memory_order_release);
+      end_combat_event_epoch(nullptr);
+      reset_live_snapshot_state();
+    }
+    const bool attached_now = g_live_manager.load(std::memory_order_acquire) != nullptr;
+    pthread_mutex_unlock(&g_control_mutex);
+    char live_response[256];
+    std::snprintf(live_response, sizeof(live_response),
+                  "{\"ok\":true,\"armed\":%s,\"liveAttached\":%s}", arm ? "true" : "false",
+                  attached_now ? "true" : "false");
+    send_control_response(socket_fd, live_response);
+    return;
+  }
+
+  if (std::strcmp(command, "live-players") == 0) {
+    // Read-only diagnostic built on the offline-verified object graph: the
+    // captured objectManager exposes its object vector at +0x08/+0x10/+0x14;
+    // each object carries owner (int32 +0x78), card id (+0xac) and, for spawned
+    // entities, a player-state reference at +0x100. Any pointer P with
+    // P+0x10 == objectManager is the live player state (the same edge the
+    // offline world graph uses). Every read is gated by readability.
+    std::unique_ptr<char[]> players_response(new (std::nothrow) char[8192]());
+    if (players_response == nullptr) {
+      send_control_error(socket_fd, "could not allocate live-players response");
+      return;
+    }
+    const std::uint64_t live_generation = g_live_generation.load(std::memory_order_acquire);
+    const std::uint64_t object_manager_generation =
+        g_live_object_manager_generation.load(std::memory_order_acquire);
+    void *const object_manager = object_manager_generation == live_generation && live_generation != 0
+                                     ? g_live_object_manager.load(std::memory_order_acquire)
+                                     : nullptr;
+    void **objects = nullptr;
+    std::int32_t capacity = 0;
+    std::int32_t count = 0;
+    bool vector_valid = false;
+    if (object_manager != nullptr && process_range_is_readable(object_manager, 0x18)) {
+      objects = read_object_field<void **>(object_manager, 0x08);
+      capacity = read_object_field<std::int32_t>(object_manager, 0x10);
+      count = read_object_field<std::int32_t>(object_manager, 0x14);
+      vector_valid = count >= 0 && capacity >= count && capacity <= 100000 &&
+                     (count == 0 || objects != nullptr);
+    }
+    size_t used = 0;
+    used += static_cast<size_t>(std::snprintf(
+        players_response.get(), 8192,
+        "{\"ok\":true,\"objectManager\":\"%p\",\"vectorValid\":%s,\"count\":%d,\"owners\":[",
+        object_manager, vector_valid ? "true" : "false", vector_valid ? count : -1));
+    int owner_counts[4] = {0, 0, 0, 0};
+    void *player_candidates[2] = {nullptr, nullptr};
+    // Latched candidates: the live player objects are stable for the whole match
+    // (verified across spawns), so the first structurally-valid + elixir-sane
+    // candidate per owner is reused for the rest of the battle. A latch self-
+    // heals when its pointer becomes unreadable (scene teardown).
+    std::uint64_t latched_generation = g_live_latched_players_generation.load(std::memory_order_acquire);
+    if (latched_generation != live_generation) {
+      g_live_latched_players[0].store(nullptr, std::memory_order_release);
+      g_live_latched_players[1].store(nullptr, std::memory_order_release);
+      g_live_latched_players_generation.store(live_generation, std::memory_order_release);
+    }
+    // Prefer owner-tagged references captured directly by combat_spawn_hook.
+    // A shared back-reference can appear under objects owned by both sides, so
+    // an owner-blind scan must never duplicate one decoy into both slots.
+    if (live_generation != 0 &&
+        g_live_player_objects_generation.load(std::memory_order_acquire) == live_generation) {
+      for (int owner = 0; owner < kPlayerCount; ++owner) {
+        void *candidate = g_live_player_objects[owner].load(std::memory_order_acquire);
+        if (live_player_root_is_valid(candidate, object_manager)) {
+          player_candidates[owner] = candidate;
+        }
+      }
+    }
+    if (vector_valid) {
+      const std::int32_t limit = count < 400 ? count : 400;
+      for (std::int32_t slot = 0; slot < limit; ++slot) {
+        void *object = objects[slot];
+        if (object == nullptr || !process_range_is_readable(object, 0xb0)) {
+          continue;
+        }
+        const std::int32_t owner = read_object_field<std::int32_t>(object, 0x78);
+        if (owner >= 0 && owner < 4) {
+          ++owner_counts[owner];
+          if (owner < 2) {
+            if (player_candidates[owner] != nullptr) {
+              continue;
+            }
+            // Prefer the latched candidate, but a decoy latch (permanent zero
+            // elixir) must not survive: verify the latch still points at a live
+            // player whose elixir slot is sane, and keep scanning the owner's
+            // objects for a nonzero-elixir candidate whenever the latch reads 0.
+            void *latched = g_live_latched_players[owner].load(std::memory_order_acquire);
+            if (latched != nullptr && live_player_root_is_valid(latched, object_manager)) {
+              const std::int32_t latched_elixir = read_object_field<std::int32_t>(latched, 0x2f8);
+              if (latched_elixir > 0) {
+                player_candidates[owner] = latched;
+                continue;
+              }
+            }
+            if (latched != nullptr) {
+              g_live_latched_players[owner].store(nullptr, std::memory_order_release);
+            }
+            // Walk the object's fields for the player-state back-reference. All
+            // candidates across all of this owner's objects are considered: pick
+            // the first structurally-valid one, override with any that shows a
+            // nonzero elixir (a decoy reads zero forever, a real player fills).
+            if (process_range_is_readable(object, 0x300)) {
+              for (std::size_t offset = 0; offset + 8 <= 0x300; offset += 8) {
+                void *candidate = read_object_field<void *>(object, offset);
+                if (candidate == nullptr || !process_range_is_readable(candidate, 0x240)) {
+                  continue;
+                }
+                if (live_player_root_is_valid(candidate, object_manager)) {
+                  const std::int32_t candidate_elixir = read_object_field<std::int32_t>(candidate, 0x2f8);
+                  if (candidate_elixir >= -1 && candidate_elixir <= 100000) {
+                    if (player_candidates[owner] == nullptr) {
+                      player_candidates[owner] = candidate;
+                    }
+                    if (candidate_elixir > 0) {
+                      player_candidates[owner] = candidate;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+            if (player_candidates[owner] != nullptr) {
+              const std::int32_t chosen_elixir =
+                  read_object_field<std::int32_t>(player_candidates[owner], 0x2f8);
+              if (chosen_elixir > 0) {
+                g_live_latched_players[owner].store(player_candidates[owner], std::memory_order_release);
+              }
+            }
+          }
+        }
+      }
+    }
+    used += static_cast<size_t>(std::snprintf(players_response.get() + used, 8192 - used,
+                                              "[%d,%d,%d,%d]],\"players\":[", owner_counts[0], owner_counts[1],
+                                              owner_counts[2], owner_counts[3]));
+    bool first = true;
+    for (int index = 0; index < 2; ++index) {
+      void *const player = player_candidates[index];
+      used += static_cast<size_t>(std::snprintf(players_response.get() + used, 8192 - used, "%s{\"index\":%d,",
+                                                first ? "" : ",", index));
+      first = false;
+      if (player == nullptr || !process_range_is_readable(player, 0x320)) {
+        used += static_cast<size_t>(std::snprintf(players_response.get() + used, 8192 - used,
+                                                  "\"valid\":false,\"pointer\":\"%p\"}", player));
+        continue;
+      }
+      const std::int32_t elixir_raw = read_object_field<std::int32_t>(player, 0x2f8);
+      void *const identity = read_object_field<void *>(player, 0x30);
+      void *const deck = read_object_field<void *>(player, 0x88);
+      const std::uint32_t account_id_low =
+          identity != nullptr && process_range_is_readable(identity, 0x08)
+              ? read_object_field<std::uint32_t>(identity, 0x04)
+              : 0;
+      used += static_cast<size_t>(
+          std::snprintf(players_response.get() + used, 8192 - used,
+                        "\"valid\":true,\"pointer\":\"%p\",\"elixirRaw\":%d,\"elixir\":%.2f,"
+                        "\"accountIdLow\":%u,\"identity\":\"%p\",\"deck\":\"%p\"}",
+                        player, elixir_raw, static_cast<double>(elixir_raw) / 10000.0, account_id_low, identity,
+                        deck));
+    }
+    used += static_cast<size_t>(std::snprintf(players_response.get() + used, 8192 - used, "]}"));
+    send_control_response(socket_fd, players_response.get());
+    return;
+  }
+
+  if (std::strcmp(command, "live-root-diagnostic") == 0) {
+    // This command intentionally reports only atomics and the already-published
+    // snapshot metadata. It never walks the live object graph from the control
+    // thread, so it is safe to poll during scene transitions.
+    const void *const manager = g_live_manager.load(std::memory_order_acquire);
+    const void *const world = g_live_world.load(std::memory_order_acquire);
+    const void *const object_manager = g_live_object_manager.load(std::memory_order_acquire);
+    const std::uint64_t generation = g_live_generation.load(std::memory_order_acquire);
+    const std::uint64_t object_manager_generation =
+        g_live_object_manager_generation.load(std::memory_order_acquire);
+    const void *const player_object = g_live_player_object.load(std::memory_order_acquire);
+    const std::uint64_t player_object_generation =
+        g_live_player_object_generation.load(std::memory_order_acquire);
+    const std::uint64_t sequence = g_live_snapshot_sequence.load(std::memory_order_acquire);
+    pthread_mutex_lock(&g_live_snapshot_mutex);
+    const bool snapshot_present = g_live_snapshot_present && g_live_snapshot_json[0] != '\0';
+    const std::uint64_t snapshot_tick =
+        g_live_snapshot_tick == static_cast<std::uint64_t>(-1) ? 0 : g_live_snapshot_tick;
+    pthread_mutex_unlock(&g_live_snapshot_mutex);
+    char diagnostic[1024];
+    std::snprintf(diagnostic, sizeof(diagnostic),
+                  "{\"ok\":true,\"schema\":\"live-root-diagnostic.v1\","
+                  "\"armed\":%s,\"generation\":%llu,\"snapshotSequence\":%llu,"
+                  "\"snapshotPresent\":%s,\"snapshotTick\":%llu,"
+                  "\"manager\":\"%p\",\"world\":\"%p\",\"objectManager\":\"%p\","
+                  "\"objectManagerGeneration\":%llu,\"playerObject\":\"%p\","
+                  "\"playerObjectGeneration\":%llu,\"worldSeen\":%s,"
+                  "\"deepTelemetryEnabled\":false,\"playerLatchesGeneration\":%llu}",
+                  g_live_attach_armed.load(std::memory_order_acquire) ? "true" : "false",
+                  static_cast<unsigned long long>(generation), static_cast<unsigned long long>(sequence),
+                  snapshot_present ? "true" : "false", static_cast<unsigned long long>(snapshot_tick), manager, world,
+                  object_manager, static_cast<unsigned long long>(object_manager_generation), player_object,
+                  static_cast<unsigned long long>(player_object_generation),
+                  g_live_world_seen.load(std::memory_order_acquire) ? "true" : "false",
+                  static_cast<unsigned long long>(g_live_latched_players_generation.load(std::memory_order_acquire)));
+    send_control_response(socket_fd, diagnostic);
     return;
   }
 
@@ -6730,21 +7328,43 @@ void handle_control_command(int socket_fd, const char *command) {
       send_control_error(socket_fd, "could not allocate ordinary observation response");
       return;
     }
+    // Serve the live observation from the step-hook snapshot when one exists;
+    // the control thread never dereferences live game memory for live matches.
+    pthread_mutex_lock(&g_live_snapshot_mutex);
+    const bool snapshot_present = g_live_snapshot_present && g_live_snapshot_json[0] != '\0';
+    if (snapshot_present) {
+      std::memcpy(observation_response.get(), g_live_snapshot_json, kLiveSnapshotBytes);
+    }
+    pthread_mutex_unlock(&g_live_snapshot_mutex);
+    if (snapshot_present) {
+      send_control_response(socket_fd, observation_response.get());
+      return;
+    }
     pthread_mutex_lock(&g_control_mutex);
-    void *const observed_manager =
-        g_runner_mode.load(std::memory_order_acquire) == static_cast<std::int32_t>(RunnerMode::NativeRender)
-            ? g_native_render_manager.load(std::memory_order_acquire)
-            : g_controlled_manager;
-    const bool succeeded = build_observation_json(observed_manager,
-                                                  g_runner_mode.load(std::memory_order_relaxed) ==
-                                                          static_cast<std::int32_t>(RunnerMode::NativeRender)
-                                                      ? g_native_render_request_sequence
-                                                      : g_control_generation,
-                                                  observation_response.get(), kOrdinaryObservationResponseBytes);
+    void *observed_manager = nullptr;
+    std::uint64_t observed_generation = 0;
+    void *observed_world_override = nullptr;
+    void *const live_observed_manager = g_live_manager.load(std::memory_order_acquire);
+    const std::uint64_t live_observed_generation = g_live_generation.load(std::memory_order_acquire);
+    if (live_observed_manager != nullptr && live_observed_generation != 0) {
+      observed_manager = live_observed_manager;
+      observed_generation = live_observed_generation;
+      observed_world_override = g_live_world.load(std::memory_order_acquire);
+    } else if (g_runner_mode.load(std::memory_order_relaxed) == static_cast<std::int32_t>(RunnerMode::NativeRender)) {
+      observed_manager = g_native_render_manager.load(std::memory_order_acquire);
+      observed_generation = g_native_render_request_sequence;
+    } else {
+      observed_manager = g_controlled_manager;
+      observed_generation = g_control_generation;
+    }
+    const bool succeeded = observed_manager != nullptr &&
+                           build_observation_json(observed_manager, observed_generation,
+                                                  observation_response.get(), kOrdinaryObservationResponseBytes,
+                                                  nullptr, observed_world_override);
     pthread_mutex_unlock(&g_control_mutex);
     if (!succeeded && observation_response[0] == '\0') {
       std::snprintf(observation_response.get(), kOrdinaryObservationResponseBytes,
-                    "{\"ok\":false,\"error\":\"failed to encode observation\"}");
+                    "{\"ok\":false,\"error\":\"live observation not captured yet\"}");
     }
     send_control_response(socket_fd, observation_response.get());
     return;
@@ -6758,16 +7378,38 @@ void handle_control_command(int socket_fd, const char *command) {
       return;
     }
     pthread_mutex_lock(&g_control_mutex);
-    void *const observed_manager =
-        g_runner_mode.load(std::memory_order_acquire) == static_cast<std::int32_t>(RunnerMode::NativeRender)
-            ? g_native_render_manager.load(std::memory_order_acquire)
-            : g_controlled_manager;
-    const bool succeeded = build_rich_observation_json(observed_manager,
-                                                       g_runner_mode.load(std::memory_order_relaxed) ==
-                                                               static_cast<std::int32_t>(RunnerMode::NativeRender)
-                                                           ? g_native_render_request_sequence
-                                                           : g_control_generation,
-                                                       rich_response.get(), kFullObservationResponseBytes);
+    void *rich_observed_manager = nullptr;
+    std::uint64_t rich_observed_generation = 0;
+    void *const live_rich_manager = g_live_manager.load(std::memory_order_acquire);
+    if (live_rich_manager != nullptr && g_live_generation.load(std::memory_order_acquire) != 0) {
+      // Live server-driven attach takes precedence; read-only like observe.
+      rich_observed_manager = live_rich_manager;
+      rich_observed_generation = g_live_generation.load(std::memory_order_acquire);
+    } else if (g_runner_mode.load(std::memory_order_acquire) == static_cast<std::int32_t>(RunnerMode::NativeRender)) {
+      rich_observed_manager = g_native_render_manager.load(std::memory_order_acquire);
+      rich_observed_generation = g_native_render_request_sequence;
+    } else {
+      rich_observed_manager = g_controlled_manager;
+      rich_observed_generation = g_control_generation;
+    }
+    void *rich_world_override = nullptr;
+    if (live_rich_manager != nullptr && rich_observed_manager == live_rich_manager) {
+      // Rich runtime fields are deliberately disabled for live matches during
+      // the first read-only validation phase.  Returning a structured status
+      // keeps callers from accidentally re-enabling unsafe deep reads merely by
+      // polling observe-rich.
+      pthread_mutex_unlock(&g_control_mutex);
+      std::snprintf(rich_response.get(), kFullObservationResponseBytes,
+                    "{\"ok\":false,\"schema\":\"native-rich-telemetry.v3\","
+                    "\"error\":\"live deep telemetry is disabled\","
+                    "\"generation\":%llu,\"deepTelemetryEnabled\":false}",
+                    static_cast<unsigned long long>(rich_observed_generation));
+      send_control_response(socket_fd, rich_response.get());
+      return;
+    }
+    const bool succeeded = build_rich_observation_json(rich_observed_manager, rich_observed_generation,
+                                                       rich_response.get(), kFullObservationResponseBytes, nullptr,
+                                                       rich_world_override);
     pthread_mutex_unlock(&g_control_mutex);
     if (!succeeded && rich_response[0] == '\0') {
       std::snprintf(rich_response.get(), kFullObservationResponseBytes,
@@ -7323,8 +7965,8 @@ void handle_control_command(int socket_fd, const char *command) {
   send_control_error(
       socket_fd,
       "commands: configure REPLAY_JSON, configure-native REPLAY_JSON, "
-      "status, attest, touch status, "
-      "render on|off|status, observe, observe-rich, observe-atomic, session-v1, reset, step N, advance-native N, play DELAY ADVANCE "
+      "status, attest, touch status, live-observe on|off, "
+      "live-root-diagnostic, live-players, render on|off|status, observe, observe-rich, observe-atomic, session-v1, reset, step N, advance-native N, play DELAY ADVANCE "
       "COUNT [OWNER HAND_INDEX X Y]..., transition DELAY ADVANCE COUNT [PLAYER CARD PD X Y]..., deploy PLAYER CARD PD "
       "X Y [DELAY], activate-ability OWNER OBJECT_INDEX SECONDARY_INDEX [DELAY], replay-schedule-card OWNER CARD_ID X "
       "Y EXECUTE_TICK, replay-schedule-ability OWNER NAME_HINTS EXECUTE_TICK, replay-schedule-status SEQUENCE, "
@@ -7827,12 +8469,109 @@ void game_state_load_hook(void *manager, void *battle, void *command_array, void
 
 
 void game_state_step_hook(void *manager) {
+  if (manager != nullptr) {
+    g_recent_step_manager.store(manager, std::memory_order_release);
+  }
+  // Combat-epoch liveness sentinel: the epoch's game_manager can be freed by the
+  // game between scene transitions while the epoch stays active. Every step call
+  // on the game thread re-validates the binding and closes the epoch the moment
+  // its manager is gone, so no other hook can dereference the freed pointer.
+  if (g_combat_epoch_active.load(std::memory_order_acquire)) {
+    void *const bound_manager = g_combat_game_manager.load(std::memory_order_acquire);
+    bool stale = bound_manager != nullptr && !process_range_is_readable(bound_manager, 0xb0);
+    if (!stale && bound_manager != nullptr) {
+      // A freed manager can remain mapped with poisoned internals, so a bare
+      // readability check is not enough. Liveness rule: the bound manager must
+      // either be the manager currently stepping, or still carry a world at
+      // +0xa8. A manager freed at a scene transition never steps again and its
+      // world slot is cleared, so both signals fail together.
+      const void *bound_world = read_object_field<const void *>(bound_manager, 0xa8);
+      if (bound_manager != g_recent_step_manager.load(std::memory_order_acquire) && bound_world == nullptr) {
+        stale = true;
+      }
+    }
+    if (stale) {
+      LOGI("combat epoch bound to freed manager %p; closing epoch", bound_manager);
+      end_combat_event_epoch(nullptr);
+    }
+  }
   const std::uint64_t submitted_generation = g_native_render_submitted_sequence.load(std::memory_order_acquire);
   const bool native_render_manager =
       g_runner_mode.load(std::memory_order_acquire) == static_cast<std::int32_t>(RunnerMode::NativeRender) &&
       submitted_generation != 0 &&
       g_native_render_loaded_sequence.load(std::memory_order_acquire) == submitted_generation &&
       g_native_render_manager.load(std::memory_order_acquire) == manager;
+  // Live server-driven matches are identified passively by exclusion: while armed,
+  // the first stepped manager that belongs to neither the controlled worker nor a
+  // native-render session is adopted. Attachment only records the manager pointer
+  // and redirects read-only telemetry; stepping, gating, and command paths are
+  // never applied to it. The adopt stays armed: a later fresh manager (the actual
+  // battle mounting after the lobby scene) replaces the earlier adoption, and the
+  // observe self-validation releases menu managers whose graph fails to encode.
+  if (g_live_attach_armed.load(std::memory_order_acquire) && manager != nullptr && !native_render_manager &&
+      manager != g_controlled_manager) {
+    g_live_attach_calls.fetch_add(1, std::memory_order_relaxed);
+    pthread_mutex_lock(&g_control_mutex);
+    void *const previous_live = g_live_manager.load(std::memory_order_acquire);
+    if (previous_live != manager) {
+      if (previous_live != nullptr) {
+        end_combat_event_epoch(nullptr);
+      }
+      g_live_manager.store(manager, std::memory_order_release);
+      ++g_control_generation;
+      const std::uint64_t live_generation = g_control_generation;
+      g_live_generation.store(live_generation, std::memory_order_release);
+      reset_live_snapshot_state();
+      begin_runtime_telemetry_epoch(manager, live_generation, live_generation, false);
+      bind_combat_event_object_manager(manager);
+      LOGI("live attach: manager=%p generation=%llu previous=%p", manager,
+           static_cast<unsigned long long>(live_generation), previous_live);
+    }
+    pthread_mutex_unlock(&g_control_mutex);
+  }
+  // Capture a live observation snapshot from inside the game's own step call:
+  // the manager is alive here by construction, so deep graph reads are safe
+  // without cross-thread lifetime races. Only the bound live manager is captured,
+  // and only when its battle world has mounted.
+  if (manager != nullptr && manager == g_live_manager.load(std::memory_order_acquire) &&
+      !native_render_manager && manager != g_controlled_manager) {
+    void *live_world = live_world_for_manager_locked(manager);
+    if (live_world != nullptr && live_world_graph_is_valid(live_world)) {
+      void **live_objects = nullptr;
+      std::int32_t live_count = 0;
+      void *live_player_zero = read_object_field<void *>(live_world, 0xe0);
+      void *live_object_manager =
+          live_player_zero == nullptr ? nullptr : read_object_field<void *>(live_player_zero, 0x10);
+      (void)live_object_vector_is_valid(live_object_manager, &live_objects, &live_count);
+      const std::uint64_t snapshot_generation = g_live_generation.load(std::memory_order_acquire);
+      g_live_world.store(live_world, std::memory_order_release);
+      g_live_object_manager.store(live_object_manager, std::memory_order_release);
+      g_live_object_manager_generation.store(snapshot_generation, std::memory_order_release);
+      g_live_tick.store(g_game_state_tick == nullptr ? -1 : g_game_state_tick(manager), std::memory_order_release);
+      g_live_world_seen.store(true, std::memory_order_release);
+      char snapshot[kLiveSnapshotBytes];
+      if (build_observation_json(manager, snapshot_generation, snapshot, sizeof(snapshot), nullptr, live_world)) {
+        pthread_mutex_lock(&g_live_snapshot_mutex);
+        std::memcpy(g_live_snapshot_json, snapshot, sizeof(snapshot));
+        g_live_snapshot_tick = g_game_state_tick == nullptr ? -1 : g_game_state_tick(manager);
+        g_live_snapshot_present = true;
+        pthread_mutex_unlock(&g_live_snapshot_mutex);
+        g_live_snapshot_sequence.fetch_add(1, std::memory_order_release);
+      }
+    } else if (g_live_world_seen.load(std::memory_order_acquire)) {
+      // A live scene transition can invalidate a graph that was previously
+      // valid. Only then detach. Before the first world is observed, a null or
+      // loading graph is expected in the lobby and must not churn generation.
+      pthread_mutex_lock(&g_control_mutex);
+      if (g_live_manager.load(std::memory_order_acquire) == manager) {
+        g_live_manager.store(nullptr, std::memory_order_release);
+        g_live_generation.store(0, std::memory_order_release);
+        end_combat_event_epoch(nullptr);
+        reset_live_snapshot_state();
+      }
+      pthread_mutex_unlock(&g_control_mutex);
+    }
+  }
   if (native_render_manager) {
     pthread_mutex_lock(&g_control_mutex);
     const std::int32_t current_tick = g_native_render_tick.load(std::memory_order_acquire);

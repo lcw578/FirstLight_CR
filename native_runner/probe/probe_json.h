@@ -23,6 +23,8 @@ public:
       : buffer_(buffer), capacity_(capacity), offset_(offset) {}
 
   bool good() const { return good_; }
+  int fail_line() const { return fail_line_; }
+  void mark(int line) { if (!good_ && fail_line_ == 0) fail_line_ = line; }
   explicit operator bool() const { return good(); }
 
   bool append(const char *format, ...) {
@@ -134,4 +136,5 @@ private:
   std::size_t capacity_;
   std::size_t *offset_;
   bool good_ = true;
+  mutable int fail_line_ = 0;
 };

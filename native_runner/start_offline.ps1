@@ -12,6 +12,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# MuMuManager emits UTF-8; Windows PowerShell decodes native output with the
+# ANSI code page by default, so a localized VM name (e.g. 模拟器) would arrive
+# as mojibake and fail the identity check below.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot "local_config.ps1")
 if (-not $PSBoundParameters.ContainsKey("VmIndex")) { $VmIndex = Get-LocalSetting "CR_VM_INDEX" }
 if (-not $PSBoundParameters.ContainsKey("VmName")) { $VmName = Get-LocalSetting "CR_VM_NAME" }

@@ -2502,6 +2502,8 @@ class NativeClashEnv:
             "observe",
             "observe-rich",
             "observe-atomic",
+            "live-root-diagnostic",
+            "live-players",
             "render status",
             "touch status",
             "attest",
@@ -2759,6 +2761,28 @@ class NativeClashEnv:
 
     def observe(self) -> dict[str, Any]:
         return self._request("observe")
+
+    def set_live_observation(self, enabled: bool) -> dict[str, Any]:
+        """Arm or disarm read-only observation of a server-driven live match.
+
+        The probe remains passive: this does not pause the game or authorize
+        command injection.  Use :meth:`live_root_diagnostic` to verify manager
+        and snapshot lifecycle before connecting a policy.
+        """
+
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool")
+        return self._request("live-observe on" if enabled else "live-observe off")
+
+    def live_root_diagnostic(self) -> dict[str, Any]:
+        """Return the probe's lock-free live root/snapshot diagnostics."""
+
+        return self._request("live-root-diagnostic")
+
+    def live_players(self) -> dict[str, Any]:
+        """Return the existing read-only player candidate diagnostics."""
+
+        return self._request("live-players")
 
     def observe_rich(self) -> dict[str, Any]:
         """Return validated native component/runtime telemetry.

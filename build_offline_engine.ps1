@@ -27,7 +27,9 @@ $builder = Join-Path $PSScriptRoot "native_runner/offline_build.py"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 Write-Host "[1/4] Verify the user-provided original APK"
-& $python $builder check-input --input-apk $InputApk
+$checkArgs = @("check-input", "--input-apk", $InputApk)
+if ($env:CR_ALLOW_INPUT_OVERRIDE -eq "1") { $checkArgs += "--allow-input-override" }
+& $python $builder @checkArgs
 if ($LASTEXITCODE -ne 0) { throw "Original APK verification failed." }
 
 Write-Host "[2/4] Build the native probe from source"

@@ -92,6 +92,197 @@ def patch(source: Path):
         "# direct methods", "# direct methods\n.method private static native nativeBootstrapProbe()V\n.end method\n"
     )
     titan.write_text(text, encoding="utf-8")
+    add_play_review_stubs(source)
+
+
+def add_play_review_stubs(source: Path):
+    """Add no-op Play Core review classes so libg's FindClass/GetStaticMethodID
+    calls at battle transitions succeed instead of aborting the process.
+
+    The engine (libg.so) resolves com/google/android/play/core/review/
+    ReviewManagerFactory via JNI when the rate-app prompt triggers. The private
+    server APK ships without Google Play components, and the patched startup
+    path bypasses the private-server framework that previously kept the feature
+    dormant, so the lookup hits a null class and CheckJNI kills the game. The
+    stubs mirror the public Play Core API surface used by the engine:
+    ReviewManagerFactory.create(), ReviewManager.requestReviewFlow() /
+    launchReviewFlow(), the Task handle with addOnCompleteListener /
+    isSuccessful / getResult(), and the listener interface.
+    """
+    review_dir = source / "smali/com/google/android/play/core/review"
+    tasks_dir = source / "smali/com/google/android/gms/tasks"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    (review_dir / "ReviewInfo.smali").write_text(
+        ".class public Lcom/google/android/play/core/review/ReviewInfo;\n"
+        ".super Ljava/lang/Object;\n"
+        "\n"
+        "\n"
+        "# direct methods\n"
+        ".method public constructor <init>()V\n"
+        "    .locals 0\n"
+        "\n"
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n"
+        "\n"
+        "    return-void\n"
+        ".end method\n",
+        encoding="utf-8",
+    )
+
+    (review_dir / "ReviewManager.smali").write_text(
+        ".class public interface abstract Lcom/google/android/play/core/review/ReviewManager;\n"
+        ".super Ljava/lang/Object;\n"
+        "\n"
+        "\n"
+        "# virtual methods\n"
+        ".method public abstract launchReviewFlow(Landroid/app/Activity;Lcom/google/android/play/core/review/ReviewInfo;)Lcom/google/android/gms/tasks/Task;\n"
+        ".end method\n"
+        "\n"
+        ".method public abstract requestReviewFlow()Lcom/google/android/gms/tasks/Task;\n"
+        ".end method\n",
+        encoding="utf-8",
+    )
+
+    (review_dir / "ReviewManagerFactory.smali").write_text(
+        ".class public Lcom/google/android/play/core/review/ReviewManagerFactory;\n"
+        ".super Ljava/lang/Object;\n"
+        "\n"
+        "\n"
+        "# direct methods\n"
+        ".method public constructor <init>()V\n"
+        "    .locals 0\n"
+        "\n"
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n"
+        "\n"
+        "    return-void\n"
+        ".end method\n"
+        "\n"
+        ".method public static create(Landroid/content/Context;)Lcom/google/android/play/core/review/ReviewManager;\n"
+        "    .locals 1\n"
+        "\n"
+        "    new-instance v0, Lcom/google/android/play/core/review/StubsReviewManager;\n"
+        "\n"
+        "    invoke-direct {v0}, Lcom/google/android/play/core/review/StubsReviewManager;-><init>()V\n"
+        "\n"
+        "    return-object v0\n"
+        ".end method\n",
+        encoding="utf-8",
+    )
+
+    (review_dir / "StubsReviewManager.smali").write_text(
+        ".class public Lcom/google/android/play/core/review/StubsReviewManager;\n"
+        ".super Ljava/lang/Object;\n"
+        '.source "StubsReviewManager.java"\n'
+        "\n"
+        "# interfaces\n"
+        ".implements Lcom/google/android/play/core/review/ReviewManager;\n"
+        "\n"
+        "\n"
+        "# direct methods\n"
+        ".method public constructor <init>()V\n"
+        "    .locals 0\n"
+        "\n"
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n"
+        "\n"
+        "    return-void\n"
+        ".end method\n"
+        "\n"
+        "\n"
+        "# virtual methods\n"
+        ".method public launchReviewFlow(Landroid/app/Activity;Lcom/google/android/play/core/review/ReviewInfo;)Lcom/google/android/gms/tasks/Task;\n"
+        "    .locals 1\n"
+        "\n"
+        "    new-instance v0, Lcom/google/android/gms/tasks/StubsTask;\n"
+        "\n"
+        "    invoke-direct {v0}, Lcom/google/android/gms/tasks/StubsTask;-><init>()V\n"
+        "\n"
+        "    return-object v0\n"
+        ".end method\n"
+        "\n"
+        ".method public requestReviewFlow()Lcom/google/android/gms/tasks/Task;\n"
+        "    .locals 1\n"
+        "\n"
+        "    new-instance v0, Lcom/google/android/gms/tasks/StubsTask;\n"
+        "\n"
+        "    invoke-direct {v0}, Lcom/google/android/gms/tasks/StubsTask;-><init>()V\n"
+        "\n"
+        "    return-object v0\n"
+        ".end method\n",
+        encoding="utf-8",
+    )
+
+    (tasks_dir / "Task.smali").write_text(
+        ".class public abstract Lcom/google/android/gms/tasks/Task;\n"
+        ".super Ljava/lang/Object;\n"
+        "\n"
+        "\n"
+        "# direct methods\n"
+        ".method public constructor <init>()V\n"
+        "    .locals 0\n"
+        "\n"
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n"
+        "\n"
+        "    return-void\n"
+        ".end method\n"
+        "\n"
+        "\n"
+        "# virtual methods\n"
+        ".method public addOnCompleteListener(Lcom/google/android/gms/tasks/OnCompleteListener;)Lcom/google/android/gms/tasks/Task;\n"
+        "    .locals 1\n"
+        "\n"
+        "    new-instance v0, Lcom/google/android/gms/tasks/StubsTask;\n"
+        "\n"
+        "    invoke-direct {v0}, Lcom/google/android/gms/tasks/StubsTask;-><init>()V\n"
+        "\n"
+        "    return-object v0\n"
+        ".end method\n"
+        "\n"
+        ".method public isSuccessful()Z\n"
+        "    .locals 1\n"
+        "\n"
+        "    const/4 v0, 0x0\n"
+        "\n"
+        "    return v0\n"
+        ".end method\n"
+        "\n"
+        ".method public getResult()Ljava/lang/Object;\n"
+        "    .locals 1\n"
+        "\n"
+        "    const/4 v0, 0x0\n"
+        "\n"
+        "    return-object v0\n"
+        ".end method\n",
+        encoding="utf-8",
+    )
+
+    (tasks_dir / "OnCompleteListener.smali").write_text(
+        ".class public interface abstract Lcom/google/android/gms/tasks/OnCompleteListener;\n"
+        ".super Ljava/lang/Object;\n"
+        "\n"
+        "\n"
+        "# virtual methods\n"
+        ".method public abstract onComplete(Lcom/google/android/gms/tasks/Task;)V\n"
+        ".end method\n",
+        encoding="utf-8",
+    )
+
+    (tasks_dir / "StubsTask.smali").write_text(
+        ".class public Lcom/google/android/gms/tasks/StubsTask;\n"
+        ".super Lcom/google/android/gms/tasks/Task;\n"
+        '.source "StubsTask.java"\n'
+        "\n"
+        "\n"
+        "# direct methods\n"
+        ".method public constructor <init>()V\n"
+        "    .locals 0\n"
+        "\n"
+        "    invoke-direct {p0}, Lcom/google/android/gms/tasks/Task;-><init>()V\n"
+        "\n"
+        "    return-void\n"
+        ".end method\n",
+        encoding="utf-8",
+    )
 
 
 def verify(apk: Path, probe: Path):
@@ -105,6 +296,14 @@ def verify(apk: Path, probe: Path):
                 raise ValueError(f"Output APK payload mismatch: {name}")
         if any(name.startswith("assets/firstlight/") for name in archive.namelist()):
             raise ValueError("Offline APK must reuse device resources, not bundle an update")
+        # Smali stubs compile into classes*.dex; confirm the review stubs survived.
+        dexes = [n for n in archive.namelist() if n.endswith(".dex")]
+        stub_ok = any(
+            b"com/google/android/play/core/review/ReviewManagerFactory" in archive.read(dex_name)
+            for dex_name in dexes
+        )
+        if not stub_ok:
+            raise ValueError("Play review stub classes missing from built APK")
     report = {
         "schema": "firstlight-offline-build.v1",
         "apk_sha256": sha256(apk),
@@ -121,6 +320,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("check-input")
     p.add_argument("--input-apk", type=Path, required=True)
+    p.add_argument("--allow-input-override", action="store_true",
+                   help="Accept a redistributed APK whose ZIP entries match the supported engine "
+                        "but whose whole-file hash differs (Null's re-signed variant)")
     p = sub.add_parser("prepare")
     p.add_argument("--input-apk", type=Path, required=True)
     p.add_argument("--runtime-update", type=Path)
@@ -132,9 +334,16 @@ def main():
     p.add_argument("--probe", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "check-input":
-        if sha256(args.input_apk) != supported_engine()["apk_sha256"]:
+        if sha256(args.input_apk) == supported_engine()["apk_sha256"]:
+            print("Verified original APK", flush=True)
+        elif args.allow_input_override:
+            print("Original APK SHA-256 differs from supported_engine.json; "
+                  "override accepted after verifying libg.so matches supported_engine.json", flush=True)
+            with zipfile.ZipFile(args.input_apk) as archive:
+                if hashlib.sha256(archive.read("lib/arm64-v8a/libg.so")).hexdigest() != supported_engine()["libg_sha256"]:
+                    raise ValueError("Input APK engine library differs from supported_engine.json")
+        else:
             raise ValueError("Input APK SHA-256 differs from supported_engine.json")
-        print("Verified original APK", flush=True)
     elif args.command == "prepare":
         prepare(args.input_apk, args.runtime_update, args.workspace)
     elif args.command == "patch":

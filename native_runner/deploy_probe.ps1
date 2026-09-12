@@ -10,6 +10,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# MuMuManager emits UTF-8; decode native output as UTF-8 so localized VM names
+# survive ConvertFrom-Json identity checks on non-UTF-8 system code pages.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot "local_config.ps1")
 if (-not $PSBoundParameters.ContainsKey("VmIndex")) { $VmIndex = Get-LocalSetting "CR_VM_INDEX" }
 if (-not $PSBoundParameters.ContainsKey("VmName")) { $VmName = Get-LocalSetting "CR_VM_NAME" }
